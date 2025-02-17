@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+#
+# Improved Shell Script for Onboarding New Foundations
+#
+# This script reads new foundation names from 'foundations.txt'.
+# For each foundation, it determines the environment (eng, dev, qa, prod),
+# clones the respective repo (if not already cloned or if refresh=1),
+# prompts for a branch name, checks out that branch,
+# copies from an existing foundation (template) or creates new folders,
+# then commits & pushes with a user-provided JIRA ticket number.
+#
+# Finally, it handles the 'newgate_triggers' repo in the same way,
+# updating all new foundations in one go, prompting for a branch,
+# and then committing & pushing changes.
+
+set -euo pipefail
+
+# ------------------------------------------------------------------
+# 1. Configuration
+# ------------------------------------------------------------------
+refresh=3                      # Set to 1 to force fresh clone each run
+workdir="/bootstrap-onboarding"
+INPUT_FILE="foundations.txt"   # File with new foundation names, one per line
+
+# Update these with your actual environment repo URLs:
+ENG_REPO_URL="bitbucketcluster04.jpmachetc.net/sap/devopps/newgate-state-eng.git"
+DEV_REPO_URL="bitbucketcluster04.jpmachetc.net/sap/devopps/newgate-state-dev.git"
+QA_REPO_URL="bitbucketcluster04.jpmachetc.net/sap/devopps/newgate-state-qa.git"
+PROD_REPO_URL="bitbucketcluster04.jpmachetc.net/sap/devopps/newgate-state-prod.git"
+
+# Update with your actual triggers repo URL:
+TRIGGERS_REPO_URL="bitbucketcluster04.jpmachetc.net/sap/devopps/newgate_triggers.git"
+
+# Example template foundation folder (if you want to copy from an existing one)
+TEMPLATE_FOUNDATION="env/base-foundation"
+
+# Create our working directory
+mkdir -p "$workdir"
+cd "$workdir"
+
+# ------------------------------------------------------------------
+# 2. Prompt for Git credentials (only if needed)
+# ------------------------------------------------------------------
+CREDENTIALS_FILE="$workdir/credentials.txt"
+if [[ "$refresh" == "1" ]] || [[ ! -f "$CREDENTIALS_FILE" ]]; then
+  echo -n "Git Username: "
+  read -r myusername
+  echo -n "Git Password: "
+  read -rs mypassword
+  echo
+  echo "${myusername}:${mypassword}" > "$CREDENTIALS_FILE"
+else
+  IFS=":" read -r myusername mypassword < "$CREDENTIALS_FILE"
+fi
+
+# ------------------------------------------------------------------
+# 3. Validate input file
+# ------------------------------------------------------------------
+if [[ ! -f "$INPUT_FILE" ]]; then
+  echo "Error: '$INPUT_FILE' not found. Exiting."
+  exit 1
+fi
+
+# ------------------------------------------------------------------
+# 4. Helper function to get repo info based on environment
+# ------------------------------------------------------------------
+function get_repo_info() {
+  local env="$1"
+  case "$env" in
+    eng)
+      echo "$ENG_REPO_URL $workdir/newgate-state-eng"
+      ;;
+    dev)
+      echo "$DEV_REPO_URL $workdir/newgate-state-dev"
+      ;;
+    qa)
+      echo "$QA_REPO_URL $workdir/newgate-state-qa"
+      ;;
+    prod)
+      echo "$PROD_REPO_URL $workdir/newgate-state-prod"
+      ;;
+    *)
+      # Return empty if unknown environment
+      echo ""
+      ;;
+  esac
+}
+
+# ------------------------------------------------------------------
+# 5. Group foundations by environment
+#    (so we only clone each env repo once, do all copies, then commit)
+# ------------------------------------------------------------------
+declare -A envToFoundations
+allFoundations=()
+
+while IFS= read -r FOUNDATION; do
+  # Skip empty lines
+  [[ -z "$FOUNDATION" ]] && continue
+
+  allFoundations+=("$FOUNDATION")
+
+  # Extract environment prefix (e.g., "eng" from "eng-abc")
+  env=$(echo "$FOUNDATION" | cut -d '-' -f1)
+
+  # Store this foundation in the array for that environment
+  envToFoundations["$env"]+="$FOUNDATION "
+done < "$INPUT_FILE"
+
+# ------------------------------------------------------------------
+# 6. Process each environment: clone repo, checkout branch,
+#    copy from template, commit, push
+# ------------------------------------------------------------------
+for env in "${!envToFoundations[@]}"; do
+  # Get the correct repo info
+  read -r REPO_URL REPO_DIR <<< "$(get_repo_info "$env")"
+
+  if [[ -z "$REPO_URL" ]]; then
+    echo "Skipping unknown environment '$env' for foundation(s): ${envToFoundations[$env]}"
+    continue
+  fi
+
+  echo "===================================================="
+  echo "Processing environment: $env"
+  echo "Foundations: ${envToFoundations[$env]}"
+  echo "Repo URL: $REPO_URL"
+  echo "Local Repo Dir: $REPO_DIR"
+  echo "===================================================="
+
+  # Clone or refresh the environment repo
+  if [[ "$refresh" == "1" ]] || [[ ! -d "$REPO_DIR" ]]; then
+    echo "Cloning fresh copy of $REPO_URL into $REPO_DIR"
+    rm -rf "$REPO_DIR" 2>/dev/null || true
+    git clone "https://${myusername}:${mypassword}@$REPO_URL" "$REPO_DIR"
+  else
+    echo "Repo directory '$REPO_DIR' already exists. Skipping clone."
+  fi
+
+  cd "$REPO_DIR"
+
+  # Prompt for the branch name to checkout
+  read -p "Enter the branch name for '$env' repo: " BRANCH
+  git checkout "$BRANCH"
+
+  # For each foundation in this environment
+  for f in ${envToFoundations[$env]}; do
+    echo "--------------------------------------------"
+    echo "Processing foundation: $f"
+
+    # Option 1: Copy from an existing template foundation folder
+    if [[ -d "$TEMPLATE_FOUNDATION" ]]; then
+      # e.g., "env/base-foundation" -> "env/$f"
+      localPath="env/$f"
+      if [[ -d "$localPath" ]]; then
+        echo "Warning: $localPath already exists. Skipping copy."
+      else
+        echo "Copying $TEMPLATE_FOUNDATION -> $localPath"
+        cp -r "$TEMPLATE_FOUNDATION" "$localPath"
+      fi
+    else
+      # Option 2: If you don't have a template, create new subfolders
+      # echo "Creating new subfolders for $f"
+      # for i in app step job; do
+      #   mkdir -p "env/$f/pool-$i-env"
+      #   echo "# pipeline vars for $f / $i" > "env/$f/pool-$i-env/pipeline-vars.yaml"
+      # done
+      echo "Warning: Template foundation '$TEMPLATE_FOUNDATION' does not exist. Adjust script or path."
+    fi
+  done
+
+  # Stage changes, prompt for JIRA, commit, push
+  git add --all
+  read -p "Enter the JIRA ticket for environment '$env': " JIRA
+  git commit -m "${JIRA} onboarding new foundations for $env"
+  git push
+
+  # Return to the main workdir
+  cd "$workdir"
+done
+
+# ------------------------------------------------------------------
+# 7. Process the triggers repository
+# ------------------------------------------------------------------
+TRIGGERS_REPO="$workdir/newgate_triggers"
+if [[ "$refresh" == "1" ]] || [[ ! -d "$TRIGGERS_REPO" ]]; then
+  echo "Cloning triggers repo from $TRIGGERS_REPO_URL into $TRIGGERS_REPO"
+  rm -rf "$TRIGGERS_REPO" 2>/dev/null || true
+  git clone "https://${myusername}:${mypassword}@$TRIGGERS_REPO_URL" "$TRIGGERS_REPO"
+else
+  echo "Triggers repo '$TRIGGERS_REPO' already exists. Skipping clone."
+fi
+
+cd "$TRIGGERS_REPO"
+
+# Prompt for branch name
+read -p "Enter the branch name for triggers repo: " TBRANCH
+git checkout "$TBRANCH"
+
+# For each foundation in allFoundations, do your "touch" or copying logic
+for f in "${allFoundations[@]}"; do
+  echo "--------------------------------------------"
+  echo "Updating triggers for foundation: $f"
+
+  # Example: create a folder in env/ for each foundation
+  # and put a minimal pipeline or triggers file there
+  if [[ ! -d "env/$f" ]]; then
+    mkdir -p "env/$f"
+    echo "Trigger details for $f" > "env/$f/trigger-vars.yaml"
+  else
+    echo "env/$f already exists in triggers repo. Skipping."
+  fi
+done
+
+# Commit & push triggers
+git add --all
+read -p "Enter the JIRA ticket for triggers repo: " JIRA_TRIG
+git commit -m "${JIRA_TRIG} onboarding new foundations in triggers"
+git push
+
+echo "===================================================="
+echo "All done! Foundations processed from '$INPUT_FILE'."
+echo "===================================================="
